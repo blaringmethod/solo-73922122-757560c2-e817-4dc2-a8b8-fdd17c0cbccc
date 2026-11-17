@@ -105,4 +105,53 @@ echo
 echo "== cancelling the already succeeded task -> HTTP 409 =="
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/tasks/$ID/cancel"
 
+echo "== index check (索引核查): controlled index prefixes =="
+# Two samples on the sheet; each read carries an 8-base ACGT index prefix.
+IC_R1="$WORK/ic_R1.fastq"; IC_R2="$WORK/ic_R2.fastq"
+python3 - "$IC_R1" "$IC_R2" <<'PY'
+import sys
+r1, r2 = sys.argv[1], sys.argv[2]
+pairs = [
+    # id, R1 prefix+body, R2 prefix+body, expected classification
+    ("p1", b"AAAAAAAA" + b"G" * 32, b"CCCCCCCC" + b"A" * 32),  # exact sample-1
+    ("p2", b"AAAAAAAG" + b"G" * 32, b"CCCCCCCA" + b"A" * 32),  # 1mm+1mm sample-1
+    ("p3", b"GGGGGGGG" + b"T" * 32, b"CCCCCCCC" + b"A" * 32),  # crossover
+    ("p4", b"NNNNNNNN" + b"C" * 32, b"NNNNNNNN" + b"G" * 32),  # unassigned
+]
+with open(r1, "wb") as f1, open(r2, "wb") as f2:
+    for rid, s1, s2 in pairs:
+        f1.write(b"@%s/1\n%s\n+\n%s\n" % (rid.encode(), s1, b"~" * len(s1)))
+        f2.write(b"@%s/2\n%s\n+\n%s\n" % (rid.encode(), s2, b"!" * len(s2)))
+PY
+IC=$(curl -fsS -X POST "$BASE_URL/tasks" \
+  -F "r1=@$IC_R1;filename=ic_R1.fastq" \
+  -F "r2=@$IC_R2;filename=ic_R2.fastq")
+IC_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$IC")
+while :; do
+  BODY=$(curl -fsS "$BASE_URL/tasks/$IC_ID")
+  STATUS=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<<"$BODY")
+  case "$STATUS" in
+    succeeded|failed|cancelled) break ;;
+  esac
+  sleep 0.3
+done
+echo "index-check task status: $STATUS"
+curl -fsS -X POST "$BASE_URL/tasks/$IC_ID/index-check" \
+  -H 'Content-Type: application/json' \
+  -d '{"samples":[
+        {"name":"sample-1","r1_index":"AAAAAAAA","r2_index":"CCCCCCCC"},
+        {"name":"sample-2","r1_index":"GGGGGGGG","r2_index":"TTTTTTTT"}
+      ]}'
+echo
+
+echo "== index check input guards: bad sheet -> 422, failed task -> 409 =="
+curl -s -o /dev/null -w 'bad index chars -> %{http_code}\n' -X POST \
+  "$BASE_URL/tasks/$IC_ID/index-check" -H 'Content-Type: application/json' \
+  -d '{"samples":[{"name":"a","r1_index":"AAAAAAAN","r2_index":"CCCCCCCC"},
+                  {"name":"b","r1_index":"GGGGGGGG","r2_index":"TTTTTTTT"}]}'
+curl -s -o /dev/null -w 'check on failed task -> %{http_code}\n' -X POST \
+  "$BASE_URL/tasks/$BAD_ID/index-check" -H 'Content-Type: application/json' \
+  -d '{"samples":[{"name":"a","r1_index":"AAAAAAAA","r2_index":"CCCCCCCC"},
+                  {"name":"b","r1_index":"GGGGGGGG","r2_index":"TTTTTTTT"}]}'
+
 echo "ALL DEMO STEPS DONE"

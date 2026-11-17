@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import tempfile
 import uuid
@@ -10,10 +11,21 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from . import config, db, worker
+from .fastq import FastqFormatError
+from .indexcheck import (
+    INDEX_LEN,
+    MAX_SAMPLES,
+    MIN_SAMPLES,
+    IndexCheckError,
+    SampleSpec,
+    run_index_check,
+)
 from .worker import UploadTooLarge, start_worker, task_dir
+
+_ACGT_RE = re.compile(r"^[ACGT]{%d}$" % INDEX_LEN)
 
 
 @asynccontextmanager
@@ -25,11 +37,14 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Paired FASTQ Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Upload shuffled paired-end FASTQ files (R1/R2, uncompressed, "
         "max 256 MiB each). The service re-pairs them by read id, delivers "
-        "both mates in R1 order and preserves the original bytes."
+        "both mates in R1 order and preserves the original bytes. "
+        "Succeeded tasks can be audited with the index-check endpoint: "
+        "streaming dual 8-base ACGT index assignment with <=1 mismatch per "
+        "end, ambiguity / suspected crossover / unassigned classification."
     ),
     lifespan=lifespan,
 )
@@ -49,6 +64,72 @@ class TaskOut(BaseModel):
     updated_at: str
     download_r1: str | None = None
     download_r2: str | None = None
+
+
+class IndexSampleIn(BaseModel):
+    name: str = Field(
+        ..., min_length=1, max_length=128, description="Sample name (unique in the sheet)"
+    )
+    r1_index: str = Field(
+        ...,
+        min_length=INDEX_LEN,
+        max_length=INDEX_LEN,
+        description=f"R1 index: exactly {INDEX_LEN} ACGT characters",
+    )
+    r2_index: str = Field(
+        ...,
+        min_length=INDEX_LEN,
+        max_length=INDEX_LEN,
+        description=f"R2 index: exactly {INDEX_LEN} ACGT characters",
+    )
+
+    @field_validator("r1_index", "r2_index")
+    @classmethod
+    def _acgt_only(cls, value: str) -> str:
+        if not _ACGT_RE.match(value):
+            raise ValueError("index must contain exactly 8 uppercase ACGT characters")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _name_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("sample name must not be blank")
+        return value
+
+
+class IndexCheckIn(BaseModel):
+    samples: list[IndexSampleIn] = Field(
+        ...,
+        description=f"Sample sheet: {MIN_SAMPLES}..{MAX_SAMPLES} uniquely named samples",
+    )
+
+    @field_validator("samples")
+    @classmethod
+    def _count_and_unique_names(cls, value: list[IndexSampleIn]) -> list[IndexSampleIn]:
+        if not (MIN_SAMPLES <= len(value) <= MAX_SAMPLES):
+            raise ValueError(
+                f"expected between {MIN_SAMPLES} and {MAX_SAMPLES} samples, "
+                f"got {len(value)}"
+            )
+        names = [item.name for item in value]
+        if len(set(names)) != len(names):
+            raise ValueError("sample names must be unique")
+        return value
+
+
+class IndexSampleCount(BaseModel):
+    name: str
+    count: int
+
+
+class IndexCheckOut(BaseModel):
+    task_id: str
+    total_pairs: int
+    samples: list[IndexSampleCount]
+    ambiguous: int
+    suspected_cross_sample: int
+    unassigned: int
 
 
 def _serialize(row: sqlite3.Row) -> TaskOut:
@@ -227,6 +308,32 @@ def download_r2(task_id: str) -> FileResponse:
         path, media_type="text/plain", filename="R2.fastq",
         headers={"Content-Length": str(path.stat().st_size)},
     )
+
+
+@app.post(
+    "/tasks/{task_id}/index-check",
+    response_model=IndexCheckOut,
+    summary="索引核查：按双端 8 位 ACGT 索引归属读段对",
+    description=(
+        "读取成功任务配对结果中每条读段序列的前 8 位索引（R1/R2 各一个）。"
+        "每端至多允许一次错配；按两端总错配最少的合法样本组合归属，"
+        "最优组合并列计为歧义。无合法组合时，两端各自唯一指向不同样本计为"
+        "疑似串样，其余计为未归属。逐条复核双端读段号、四行结构与序列/质量"
+        "长度；结果缺失或读取损坏时整次报错、不返回任何部分统计，也不修改"
+        "原文件。长读段按固定块流式核查，遵守 256 MiB 内存上限。"
+    ),
+)
+def index_check(task_id: str, payload: IndexCheckIn) -> IndexCheckOut:
+    samples = [
+        SampleSpec(item.name, item.r1_index, item.r2_index) for item in payload.samples
+    ]
+    try:
+        result = run_index_check(task_id, samples)
+    except IndexCheckError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except FastqFormatError as exc:
+        raise HTTPException(status_code=422, detail=f"index check failed: {exc}") from exc
+    return IndexCheckOut(**result)
 
 
 @app.get("/health")

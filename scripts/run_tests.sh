@@ -15,4 +15,12 @@ echo "=== cancel/complete arbitration tests ==="
 "$PY" -I tests/test_cancel_race.py
 
 echo
+echo "=== index-check endpoint tests ==="
+"$PY" -I tests/test_index_check.py
+
+echo
+echo "=== streaming scanner unit tests ==="
+"$PY" -I tests/test_scanner.py
+
+echo
 echo "ALL SHORT SELF-TESTS PASSED"
